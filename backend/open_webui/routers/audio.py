@@ -30,7 +30,7 @@ from fastapi import (
     APIRouter,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 
@@ -393,6 +393,14 @@ async def speech(request: Request, user=Depends(get_verified_user)):
         )
 
     body = await request.body()
+    body_compact = body.replace(b' ', b'').replace(b'\n', b'').replace(b'\t', b'').lower()
+    stream_tts = (
+        b'\"stream\":true' in body_compact
+        or request.headers.get('X-OpenWebUI-TTS-Stream') == '1'
+    )
+    requested_tts_format = str(
+        request.headers.get('X-OpenWebUI-TTS-Format') or ''
+    ).lower().strip()
     name = hashlib.sha256(
         body
         + str(request.app.state.config.TTS_ENGINE).encode('utf-8')
@@ -403,12 +411,18 @@ async def speech(request: Request, user=Depends(get_verified_user)):
     file_body_path = SPEECH_CACHE_DIR.joinpath(f'{name}.json')
 
     # Check if the file already exists in the cache
-    if file_path.is_file():
+    if file_path.is_file() and not stream_tts:
         return FileResponse(file_path)
 
     payload = None
     try:
         payload = json.loads(body.decode('utf-8'))
+        stream_tts = bool(payload.get('stream', stream_tts))
+        requested_tts_format = str(
+            payload.get('response_format')
+            or request.headers.get('X-OpenWebUI-TTS-Format')
+            or requested_tts_format
+        ).lower().strip()
     except Exception as e:
         log.exception(e)
         raise HTTPException(status_code=400, detail='Invalid JSON payload')
@@ -416,6 +430,10 @@ async def speech(request: Request, user=Depends(get_verified_user)):
     r = None
     if request.app.state.config.TTS_ENGINE == 'openai':
         payload['model'] = request.app.state.config.TTS_MODEL
+        if stream_tts:
+            payload['stream'] = True
+            if requested_tts_format:
+                payload['response_format'] = requested_tts_format
 
         try:
             timeout = aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
@@ -431,6 +449,51 @@ async def speech(request: Request, user=Depends(get_verified_user)):
                 }
                 if ENABLE_FORWARD_USER_INFO_HEADERS:
                     headers = include_user_info_headers(headers, user)
+
+                if stream_tts:
+                    stream_timeout = aiohttp.ClientTimeout(total=None)
+                    stream_session = aiohttp.ClientSession(timeout=stream_timeout, trust_env=True)
+                    r = await stream_session.post(
+                        url=f'{request.app.state.config.TTS_OPENAI_API_BASE_URL}/audio/speech',
+                        json=payload,
+                        headers=headers,
+                        ssl=AIOHTTP_CLIENT_SESSION_SSL,
+                    )
+                    try:
+                        r.raise_for_status()
+                    except Exception:
+                        await stream_session.close()
+                        raise
+
+                    content_type_header = r.headers.get('Content-Type', 'application/octet-stream')
+                    response_headers = {
+                        'Cache-Control': 'no-store',
+                        'X-Accel-Buffering': 'no',
+                    }
+                    for header_name in (
+                        'X-Audio-Codec',
+                        'X-Audio-Sample-Rate',
+                        'X-Audio-Channels',
+                        'X-Audio-Endian',
+                    ):
+                        header_value = r.headers.get(header_name)
+                        if header_value:
+                            response_headers[header_name] = header_value
+
+                    async def iter_tts_audio():
+                        try:
+                            async for chunk in r.content.iter_chunked(16384):
+                                if chunk:
+                                    yield chunk
+                        finally:
+                            r.release()
+                            await stream_session.close()
+
+                    return StreamingResponse(
+                        iter_tts_audio(),
+                        media_type=content_type_header,
+                        headers=response_headers,
+                    )
 
                 r = await session.post(
                     url=f'{request.app.state.config.TTS_OPENAI_API_BASE_URL}/audio/speech',

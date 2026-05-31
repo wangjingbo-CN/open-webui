@@ -101,20 +101,30 @@ export const synthesizeOpenAISpeech = async (
 	token: string = '',
 	speaker: string = 'alloy',
 	text: string = '',
-	model?: string
+	model?: string,
+	options?: { stream?: boolean; format?: 'pcm' | 'mp3'; signal?: AbortSignal }
 ) => {
 	let error = null;
+	const format = options?.format ?? (options?.stream ? 'pcm' : undefined);
 
 	const res = await fetch(`${AUDIO_API_BASE_URL}/speech`, {
 		method: 'POST',
+		signal: options?.signal,
 		headers: {
 			Authorization: `Bearer ${token}`,
-			'Content-Type': 'application/json'
+			'Content-Type': 'application/json',
+			...(options?.stream && {
+				Accept: format === 'pcm' ? 'application/octet-stream' : 'audio/mpeg',
+				'X-OpenWebUI-TTS-Stream': '1',
+				...(format && { 'X-OpenWebUI-TTS-Format': format })
+			})
 		},
 		body: JSON.stringify({
 			input: text,
 			voice: speaker,
-			...(model && { model })
+			...(model && { model }),
+			...(options?.stream && { stream: true }),
+			...(format && { response_format: format })
 		})
 	})
 		.then(async (res) => {
@@ -124,7 +134,6 @@ export const synthesizeOpenAISpeech = async (
 		.catch((err) => {
 			error = err.detail;
 			console.error(err);
-
 			return null;
 		});
 

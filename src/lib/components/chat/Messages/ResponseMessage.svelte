@@ -25,6 +25,7 @@
 		user
 	} from '$lib/stores';
 	import { synthesizeOpenAISpeech } from '$lib/apis/audio';
+	import { isPcmStreamResponse, playPcmStreamResponse } from '$lib/utils/pcmStreamingAudio';
 	import { imageGenerations } from '$lib/apis/images';
 	import {
 		copyToClipboard as _copyToClipboard,
@@ -318,10 +319,14 @@
 					}
 				}
 			} else {
-				for (const [, sentence] of messageContentParts.entries()) {
+				for (const [idx, sentence] of messageContentParts.entries()) {
 					if (signal.aborted) return;
 
-					const res = await synthesizeOpenAISpeech(localStorage.token, voiceId, sentence).catch(
+					const res = await synthesizeOpenAISpeech(localStorage.token, voiceId, sentence, undefined, {
+					stream: true,
+					format: 'pcm',
+					signal
+				}).catch(
 						(error) => {
 							console.error(error);
 							toast.error(`${error}`);
@@ -333,10 +338,28 @@
 					if (signal.aborted) return;
 
 					if (res && speaking) {
-						const blob = await res.blob();
-						const url = URL.createObjectURL(blob);
-						$audioQueue.enqueue(url);
-						loadingSpeech = false;
+						if (isPcmStreamResponse(res)) {
+					loadingSpeech = false;
+					await playPcmStreamResponse(res, {
+						signal,
+						initialBufferSeconds: 0.35,
+						minChunkSeconds: 0.12
+					});
+
+					if (idx === messageContentParts.length - 1 && speaking) {
+						speaking = false;
+						speakingIdx = undefined;
+
+						if ($settings.conversationMode) {
+							document.getElementById('voice-input-button')?.click();
+						}
+					}
+				} else {
+					const blob = await res.blob();
+					const url = URL.createObjectURL(blob);
+					$audioQueue.enqueue(url);
+					loadingSpeech = false;
+				}
 					}
 				}
 			}
