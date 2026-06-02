@@ -38,8 +38,8 @@ export const playPcmStreamResponse = async (
 	res: Response,
 	{
 		signal,
-		initialBufferSeconds = 0.35,
-		minChunkSeconds = 0.12,
+		initialBufferSeconds = 0.18,
+		minChunkSeconds = 0.08,
 		onPlaybackStart
 	}: PcmStreamOptions = {}
 ): Promise<void> => {
@@ -125,7 +125,12 @@ export const playPcmStreamResponse = async (
 		source.onended = () => cleanupScheduledSource(source);
 
 		// If generation stalls, keep playback moving instead of scheduling into the past.
-		nextPlayTime = Math.max(nextPlayTime, audioContext.currentTime + 0.03);
+		// nextPlayTime = Math.max(nextPlayTime, audioContext.currentTime + 0.03);
+		const now = audioContext.currentTime;
+
+		if (nextPlayTime < now + 0.01) {
+			nextPlayTime = now + 0.08;
+		}
 		source.start(nextPlayTime);
 		scheduledSources.push(source);
 
