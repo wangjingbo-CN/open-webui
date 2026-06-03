@@ -24,7 +24,12 @@
 		TTSWorker,
 		user
 	} from '$lib/stores';
-	import { synthesizeOpenAISpeech } from '$lib/apis/audio';
+	import {
+		getAudioConfig,
+		playPcm16SpeechStream,
+		synthesizeOpenAISpeech,
+		synthesizeOpenAISpeechStream
+	} from '$lib/apis/audio';
 	import { imageGenerations } from '$lib/apis/images';
 	import {
 		copyToClipboard as _copyToClipboard,
@@ -225,6 +230,144 @@
 			? ($settings?.audio?.tts?.voice ?? $config?.audio?.tts?.voice)
 			: $config?.audio?.tts?.voice);
 
+	const parseMaybeJson = (value: any): any => {
+		if (value === null || value === undefined) return value;
+
+		if (typeof value === 'string') {
+			const trimmed = value.trim();
+			if (!trimmed) return value;
+
+			if (
+				(trimmed.startsWith('{') && trimmed.endsWith('}')) ||
+				(trimmed.startsWith('[') && trimmed.endsWith(']'))
+			) {
+				try {
+					return JSON.parse(trimmed);
+				} catch {
+					return value;
+				}
+			}
+		}
+
+		return value;
+	};
+
+	const walkTTSConfig = (
+		value: any,
+		visitor: (key: string, value: any) => boolean | void,
+		key = '',
+		seen = new WeakSet<object>(),
+		depth = 0
+	): boolean => {
+		if (depth > 8 || value === null || value === undefined) return false;
+
+		const parsed = parseMaybeJson(value);
+
+		if (typeof parsed !== 'object' || parsed === null) {
+			return visitor(key, parsed) === true;
+		}
+
+		if (seen.has(parsed)) return false;
+		seen.add(parsed);
+
+		for (const [childKey, childValue] of Object.entries(parsed)) {
+			const parsedChildValue = parseMaybeJson(childValue);
+
+			if (visitor(String(childKey), parsedChildValue) === true) {
+				return true;
+			}
+
+			if (walkTTSConfig(parsedChildValue, visitor, String(childKey), seen, depth + 1)) {
+				return true;
+			}
+		}
+
+		return false;
+	};
+
+	const truthyConfigValue = (value: any) => {
+		if (value === true) return true;
+		if (typeof value === 'number') return value !== 0;
+		if (typeof value === 'string') return value.trim().toLowerCase() === 'true';
+		return false;
+	};
+
+	const getTTSConfigRoots = (audioConfig?: any) => [
+		audioConfig?.tts,
+		$config?.audio?.tts,
+		$settings?.audio?.tts,
+		model?.info?.meta?.tts
+	];
+
+	const hasConfiguredTTSStream = (audioConfig?: any) =>
+		getTTSConfigRoots(audioConfig).some((root) =>
+			walkTTSConfig(root, (key, value) => {
+				if (String(key).toLowerCase() === 'stream' && truthyConfigValue(value)) {
+					return true;
+				}
+			})
+		);
+
+	const hasConfiguredMossTTSModel = (audioConfig?: any) =>
+		getTTSConfigRoots(audioConfig).some((root) =>
+			walkTTSConfig(root, (key, value) => {
+				const keyLower = String(key).toLowerCase();
+				const valueLower = typeof value === 'string' ? value.toLowerCase() : '';
+
+				if (!valueLower) return false;
+
+				if (
+					(keyLower.includes('model') || keyLower.includes('tts')) &&
+					(valueLower.includes('moss') || valueLower.includes('onnx'))
+				) {
+					return true;
+				}
+
+				if (valueLower.includes('moss-tts-nano') || valueLower.includes('moss_tts_nano')) {
+					return true;
+				}
+			})
+		);
+
+	const getConfiguredTTSModel = (audioConfig?: any) => {
+		const backendModel = audioConfig?.tts?.MODEL ?? audioConfig?.tts?.model;
+
+		if (typeof backendModel === 'string' && backendModel.trim()) {
+			return backendModel;
+		}
+
+		let resolvedModel: string | undefined;
+
+		for (const root of getTTSConfigRoots(audioConfig)) {
+			walkTTSConfig(root, (key, value) => {
+				if (resolvedModel) return true;
+
+				const keyLower = String(key).toLowerCase();
+				if (!keyLower.includes('model') || typeof value !== 'string') return false;
+
+				const valueLower = value.toLowerCase();
+				if (valueLower.includes('moss') || valueLower.includes('onnx')) {
+					resolvedModel = value;
+					return true;
+				}
+			});
+		}
+
+		return resolvedModel;
+	};
+
+	const shouldUseMossStreamingTTS = (audioConfig?: any) => {
+		const engine = String(
+			audioConfig?.tts?.ENGINE ?? audioConfig?.tts?.engine ?? $config?.audio?.tts?.engine ?? ''
+		).toLowerCase();
+
+		return (
+			engine === 'openai' &&
+			hasConfiguredTTSStream(audioConfig) &&
+			hasConfiguredMossTTSModel(audioConfig)
+		);
+	};
+
 	const speak = async () => {
 		if (!(message?.content ?? '').trim().length) {
 			toast.info($i18n.t('No content to speak'));
@@ -318,25 +461,101 @@
 					}
 				}
 			} else {
-				for (const [, sentence] of messageContentParts.entries()) {
-					if (signal.aborted) return;
+				const audioConfig = await getAudioConfig(localStorage.token).catch((error) => {
+					console.warn('[MOSS TTS] getAudioConfig failed', error);
+					return null;
+				});
 
-					const res = await synthesizeOpenAISpeech(localStorage.token, voiceId, sentence).catch(
-						(error) => {
-							console.error(error);
-							toast.error(`${error}`);
+				const shouldUseStreamingTTS = shouldUseMossStreamingTTS(audioConfig);
+				const configuredTTSModel = getConfiguredTTSModel(audioConfig);
+
+				console.warn('[MOSS TTS]', {
+					audioConfigTTS: audioConfig?.tts
+						? {
+								ENGINE: audioConfig.tts.ENGINE,
+								MODEL: audioConfig.tts.MODEL,
+								OPENAI_PARAMS: audioConfig.tts.OPENAI_PARAMS,
+								SPLIT_ON: audioConfig.tts.SPLIT_ON
+							}
+						: null,
+					ttsConfig: $config?.audio?.tts,
+					settingsTTS: $settings?.audio?.tts,
+					modelMetaTTS: model?.info?.meta?.tts,
+					shouldUseStreamingTTS,
+					configuredTTSModel
+				});
+				if (shouldUseStreamingTTS) {
+					for (const [, sentence] of messageContentParts.entries()) {
+						if (signal.aborted) return;
+
+						const res = await synthesizeOpenAISpeechStream(
+							localStorage.token,
+							voiceId,
+							sentence,
+							configuredTTSModel,
+							signal
+						).catch((error) => {
+							if (!signal.aborted) {
+								console.error(error);
+								toast.error(`${error}`);
+							}
 							speaking = false;
 							loadingSpeech = false;
+						});
+
+						if (signal.aborted) return;
+
+						if (res && speaking) {
+							loadingSpeech = false;
+
+							await playPcm16SpeechStream(res, {
+								signal,
+								sampleRate: 48000,
+								channels: 2,
+								playbackRate: $settings.audio?.tts?.playbackRate ?? 1,
+								initialBufferMs: 200,
+								minBufferMs: 160
+							}).catch((error) => {
+								if (!signal.aborted) {
+									console.error(error);
+									toast.error(`${error}`);
+								}
+								speaking = false;
+								loadingSpeech = false;
+							});
 						}
-					);
+					}
 
-					if (signal.aborted) return;
-
-					if (res && speaking) {
-						const blob = await res.blob();
-						const url = URL.createObjectURL(blob);
-						$audioQueue.enqueue(url);
+					if (!signal.aborted) {
+						speaking = false;
+						speakingIdx = undefined;
 						loadingSpeech = false;
+
+						if ($settings.conversationMode) {
+							document.getElementById('voice-input-button')?.click();
+						}
+					}
+				} else {
+					for (const [, sentence] of messageContentParts.entries()) {
+						if (signal.aborted) return;
+
+						const res = await synthesizeOpenAISpeech(localStorage.token, voiceId, sentence).catch(
+							(error) => {
+								console.error(error);
+								toast.error(`${error}`);
+								speaking = false;
+								loadingSpeech = false;
+							}
+						);
+
+						if (signal.aborted) return;
+
+						if (res && speaking) {
+							const blob = await res.blob();
+							const url = URL.createObjectURL(blob);
+							$audioQueue.enqueue(url);
+							loadingSpeech = false;
+						}
 					}
 				}
 			}
@@ -633,6 +852,8 @@
 	});
 
 	onDestroy(() => {
+		stopAudio();
+
 		if (buttonsContainerElement) {
 			buttonsContainerElement.removeEventListener('wheel', buttonsWheelHandler);
 		}
@@ -1063,12 +1284,10 @@
 												? 'visible'
 												: 'invisible group-hover:visible'} p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition"
 											on:click={() => {
-												if (!loadingSpeech) {
-													if (speaking) {
-														stopAudio();
-													} else {
-														speak();
-													}
+												if (speaking || loadingSpeech) {
+													stopAudio();
+												} else {
+													speak();
 												}
 											}}
 										>

@@ -30,7 +30,7 @@ from fastapi import (
     APIRouter,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 
@@ -374,6 +374,108 @@ def load_speech_pipeline(request):
         request.app.state.speech_speaker_embeddings_dataset = load_dataset(
             'Matthijs/cmu-arctic-xvectors', split='validation'
         )
+
+
+@router.post('/speech/stream')
+async def speech_stream(request: Request, user=Depends(get_verified_user)):
+    if request.app.state.config.TTS_ENGINE == '':
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+
+    if user.role != 'admin' and not await has_permission(
+        user.id, 'chat.tts', request.app.state.config.USER_PERMISSIONS
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+        )
+
+    if request.app.state.config.TTS_ENGINE != 'openai':
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Streaming TTS currently supports OpenAI-compatible TTS engines only.',
+        )
+
+    try:
+        payload = await request.json()
+    except Exception as e:
+        log.exception(e)
+        raise HTTPException(status_code=400, detail='Invalid JSON payload')
+
+    openai_params = dict(request.app.state.config.TTS_OPENAI_PARAMS or {})
+
+    # These are local playback hints for Open WebUI. Do not forward them upstream.
+    sample_rate = str(openai_params.pop('pcm_sample_rate', 48000))
+    channels = str(openai_params.pop('pcm_channels', 2))
+
+    payload = {
+        **payload,
+        **openai_params,
+        'model': request.app.state.config.TTS_MODEL,
+        'stream': True,
+        'response_format': 'pcm',
+    }
+
+    if not payload.get('voice'):
+        payload['voice'] = request.app.state.config.TTS_VOICE
+
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {request.app.state.config.TTS_OPENAI_API_KEY}',
+    }
+    if ENABLE_FORWARD_USER_INFO_HEADERS:
+        headers = include_user_info_headers(headers, user)
+
+    timeout = aiohttp.ClientTimeout(total=None)
+    session = aiohttp.ClientSession(timeout=timeout, trust_env=True)
+    r = None
+
+    try:
+        r = await session.post(
+            url=f"{request.app.state.config.TTS_OPENAI_API_BASE_URL.rstrip('/')}/audio/speech",
+            json=payload,
+            headers=headers,
+            ssl=AIOHTTP_CLIENT_SESSION_SSL,
+        )
+
+        if r.status >= 400:
+            detail = await r.text()
+            raise HTTPException(status_code=r.status, detail=f'External: {detail}')
+
+    except HTTPException:
+        if r is not None:
+            r.close()
+        await session.close()
+        raise
+    except Exception as e:
+        log.exception(e)
+        if r is not None:
+            r.close()
+        await session.close()
+        raise HTTPException(status_code=500, detail='Open WebUI: Server Connection Error')
+
+    async def iter_audio_stream():
+        try:
+            async for chunk in r.content.iter_chunked(16384):
+                if chunk:
+                    yield chunk
+        finally:
+            r.close()
+            await session.close()
+
+    return StreamingResponse(
+        iter_audio_stream(),
+        media_type='audio/pcm',
+        headers={
+            'Cache-Control': 'no-store',
+            'X-Accel-Buffering': 'no',
+            'X-Audio-Sample-Rate': sample_rate,
+            'X-Audio-Channels': channels,
+            'X-Audio-Sample-Format': 's16le',
+        },
+    )
 
 
 @router.post('/speech')
