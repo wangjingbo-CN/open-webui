@@ -459,10 +459,26 @@ async def speech_stream(request: Request, user=Depends(get_verified_user)):
     async def iter_audio_stream():
         try:
             async for chunk in r.content.iter_chunked(16384):
+                if await request.is_disconnected():
+                    log.info('[MOSS TTS] downstream client disconnected; closing upstream')
+                    break
+
                 if chunk:
                     yield chunk
+
+        except asyncio.CancelledError:
+            log.info('[MOSS TTS] OpenWebUI speech stream cancelled; closing upstream')
+            raise
+
+        except (ConnectionResetError, BrokenPipeError, aiohttp.ClientConnectionError) as e:
+            log.info('[MOSS TTS] speech stream connection closed: %s', repr(e))
+
         finally:
-            r.close()
+            log.info('[MOSS TTS] closing upstream MOSS response/session')
+
+            if r is not None:
+                r.close()
+
             await session.close()
 
     return StreamingResponse(
