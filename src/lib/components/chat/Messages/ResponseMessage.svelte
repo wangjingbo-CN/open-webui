@@ -356,14 +356,22 @@
 		return resolvedModel;
 	};
 
+	const isTTSStreamEnabled = (audioConfig?: any) => {
+		const value = audioConfig?.tts?.OPENAI_PARAMS?.stream;
+		return value === true || String(value).toLowerCase() === 'true';
+	};
+
 	const shouldUseMossStreamingTTS = (audioConfig?: any) => {
 		const engine = String(
-			audioConfig?.tts?.ENGINE ?? audioConfig?.tts?.engine ?? $config?.audio?.tts?.engine ?? ''
+			audioConfig?.tts?.ENGINE ??
+				audioConfig?.tts?.engine ??
+				$config?.audio?.tts?.engine ??
+				''
 		).toLowerCase();
 
 		return (
 			engine === 'openai' &&
-			hasConfiguredTTSStream(audioConfig) &&
+			isTTSStreamEnabled(audioConfig) &&
 			hasConfiguredMossTTSModel(audioConfig)
 		);
 	};

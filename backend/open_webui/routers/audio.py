@@ -405,7 +405,17 @@ async def speech_stream(request: Request, user=Depends(get_verified_user)):
         raise HTTPException(status_code=400, detail='Invalid JSON payload')
 
     openai_params = dict(request.app.state.config.TTS_OPENAI_PARAMS or {})
+    stream_requested = str(openai_params.get('stream', '')).strip().lower() == 'true'
 
+    if not stream_requested:
+        # 普通网页 audio 播放不要走裸 PCM
+        openai_params.pop('stream', None)
+        openai_params.pop('pcm_sample_rate', None)
+        openai_params.pop('pcm_channels', None)
+
+        if str(openai_params.get('response_format', '')).strip().lower() == 'pcm':
+            openai_params['response_format'] = 'wav'
+            
     # These are local playback hints for Open WebUI. Do not forward them upstream.
     sample_rate = str(openai_params.pop('pcm_sample_rate', 48000))
     channels = str(openai_params.pop('pcm_channels', 2))
@@ -414,8 +424,6 @@ async def speech_stream(request: Request, user=Depends(get_verified_user)):
         **payload,
         **openai_params,
         'model': request.app.state.config.TTS_MODEL,
-        'stream': True,
-        'response_format': 'pcm',
     }
 
     if not payload.get('voice'):
