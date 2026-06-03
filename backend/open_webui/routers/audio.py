@@ -1681,5 +1681,24 @@ async def get_elevenlabs_voices(api_key: str) -> dict:
 
 
 @router.get('/voices')
-async def get_voices(request: Request, user=Depends(get_verified_user)):
-    return {'voices': [{'id': k, 'name': v} for k, v in (await get_available_voices(request)).items()]}
+async def get_tts_voices(request: Request, user=Depends(get_verified_user)):
+    """Proxy TTS voice list from the configured OpenAI-compatible TTS service."""
+    if request.app.state.config.TTS_ENGINE != 'openai':
+        return {'object': 'list', 'data': [], 'voices': []}
+
+    base_url = str(request.app.state.config.TTS_OPENAI_API_BASE_URL or '').rstrip('/')
+    if not base_url:
+        return {'object': 'list', 'data': [], 'voices': []}
+
+    url = f'{base_url}/audio/voices'
+    headers = {}
+    api_key = getattr(request.app.state.config, 'TTS_OPENAI_API_KEY', None)
+    if api_key:
+        headers['Authorization'] = f'Bearer {api_key}'
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers) as r:
+            if r.status >= 400:
+                text = await r.text()
+                raise HTTPException(status_code=r.status, detail=text)
+            return await r.json()

@@ -3,7 +3,7 @@
 	import { createEventDispatcher, onMount, getContext } from 'svelte';
 
 	import { user, settings, config } from '$lib/stores';
-	import { getVoices as _getVoices } from '$lib/apis/audio';
+	import { getAudioConfig, getVoices as _getVoices } from '$lib/apis/audio';
 
 	import Switch from '$lib/components/common/Switch.svelte';
 	import Spinner from '$lib/components/common/Spinner.svelte';
@@ -33,6 +33,58 @@
 	let voices = [];
 	let voice = '';
 
+
+	const MOSS_DEFAULT_VOICES = [
+		{ id: 'default', name: 'Default', localService: true },
+		{ id: 'Junhao', name: 'Junhao', description: 'Chinese male voice A', localService: true },
+		{ id: 'Zhiming', name: 'Zhiming', description: 'Chinese male voice B', localService: true },
+		{ id: 'Weiguo', name: 'Weiguo', description: 'Chinese male voice C', localService: true },
+		{ id: 'Xiaoyu', name: 'Xiaoyu', description: 'Chinese female voice A', localService: true },
+		{ id: 'Yuewen', name: 'Yuewen', description: 'Chinese female voice B', localService: true },
+		{ id: 'Lingyu', name: 'Lingyu', description: 'Chinese female voice C', localService: true },
+		{ id: 'Trump', name: 'Trump', description: 'Trump reference voice', localService: true },
+		{ id: 'Ava', name: 'Ava', description: 'English female voice A', localService: true },
+		{ id: 'Bella', name: 'Bella', description: 'English female voice B', localService: true },
+		{ id: 'Adam', name: 'Adam', description: 'English male voice A', localService: true },
+		{ id: 'Nathan', name: 'Nathan', description: 'English male voice B', localService: true },
+		{ id: 'Yui', name: 'Yui', description: 'Japanese female voice A', localService: true },
+	];
+
+	const normalizeVoiceOption = (item) => {
+		if (typeof item === 'string') {
+			return { id: item, name: item, localService: true };
+		}
+
+		const id = String(item?.id ?? item?.voice ?? item?.name ?? '').trim();
+		const name = String(item?.name ?? item?.voice ?? item?.id ?? id).trim();
+
+		if (!id) {
+			return null;
+		}
+
+		return {
+			...item,
+			id,
+			name,
+			localService: item?.localService ?? true
+		};
+	};
+
+	const getMossDefaultVoices = () => MOSS_DEFAULT_VOICES.map((item) => ({ ...item }));
+
+	const isMossTTSModel = async () => {
+		const audioConfig = await getAudioConfig(localStorage.token).catch(() => null);
+		const model = String(
+			audioConfig?.tts?.MODEL ??
+				audioConfig?.tts?.model ??
+				$config?.audio?.tts?.model ??
+				$config?.audio?.tts?.MODEL ??
+				''
+		).toLowerCase();
+
+		return model.includes('moss') || model.includes('nano');
+	};
+
 	// Audio speed control
 	let playbackRate = 1;
 
@@ -60,13 +112,21 @@
 					}
 				}, 100);
 			} else {
+				const isMoss = await isMossTTSModel();
 				const res = await _getVoices(localStorage.token).catch((e) => {
-					toast.error(`${e}`);
+					if (!isMoss) {
+						toast.error(`${e}`);
+					}
 				});
 
 				if (res) {
 					console.log(res);
-					voices = res.voices;
+					const voiceItems = Array.isArray(res) ? res : res.voices ?? res.data ?? [];
+					voices = voiceItems.map(normalizeVoiceOption).filter(Boolean);
+				}
+
+				if (isMoss && voices.length === 0) {
+					voices = getMossDefaultVoices();
 				}
 			}
 		}
@@ -245,7 +305,7 @@
 
 			<div class=" py-0.5 flex w-full justify-between">
 				<div class=" self-center text-xs font-medium">{$i18n.t('Text-to-Speech Engine')}</div>
-				<div class="flex items-center relative">
+				<div class="flex items-center relative">				
 					<select
 						class="w-fit pr-8 rounded-sm px-2 p-1 text-xs bg-transparent outline-hidden text-right"
 						bind:value={TTSEngine}
@@ -332,8 +392,10 @@
 							/>
 
 							<datalist id="voice-list">
-								{#each voices as voice}
-									<option value={voice.id}>{voice.name}</option>
+								{#each voices as _voice}
+									<option value={_voice.id}>
+										{_voice.name}{_voice.description ? ` - ${_voice.description}` : ''}
+									</option>
 								{/each}
 							</datalist>
 						</div>
@@ -393,19 +455,28 @@
 				<div class=" mb-2.5 text-sm font-medium">{$i18n.t('Set Voice')}</div>
 				<div class="flex w-full">
 					<div class="flex-1">
-						<input
-							list="voice-list"
-							class="w-full text-sm bg-transparent dark:text-gray-300 outline-hidden"
-							bind:value={voice}
-							aria-label={$i18n.t('Voice')}
-							placeholder={$i18n.t('Select a voice')}
-						/>
-
-						<datalist id="voice-list">
-							{#each voices as voice}
-								<option value={voice.id}>{voice.name}</option>
-							{/each}
-						</datalist>
+						{#if voices.length > 0}
+							<select
+								class="w-full text-sm bg-transparent dark:text-gray-300 outline-hidden"
+								bind:value={voice}
+								aria-label={$i18n.t('Voice')}
+							>
+								<option value="">{$i18n.t('Default')}</option>
+								{#each voices as _voice}
+									<option value={_voice.id} class="bg-gray-100 dark:bg-gray-700">
+										{_voice.name}{_voice.description ? ` - ${_voice.description}` : ''}
+									</option>
+								{/each}
+							</select>
+						{:else}
+							<input
+								list="voice-list"
+								class="w-full text-sm bg-transparent dark:text-gray-300 outline-hidden"
+								bind:value={voice}
+								aria-label={$i18n.t('Voice')}
+								placeholder={$i18n.t('Select a voice')}
+							/>
+						{/if}
 					</div>
 				</div>
 			</div>

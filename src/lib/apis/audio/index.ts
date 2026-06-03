@@ -27,6 +27,22 @@ export const getAudioConfig = async (token: string) => {
 	return res;
 };
 
+export const getTTSVoices = async (token: string) => {
+	const res = await fetch(`/api/v1/audio/voices`, {
+		method: 'GET',
+		headers: {
+			Accept: 'application/json',
+			authorization: `Bearer ${token}`
+		}
+	});
+
+	if (!res.ok) {
+		throw await res.json().catch(() => ({ detail: res.statusText }));
+	}
+
+	return await res.json();
+};
+
 type OpenAIConfigForm = {
 	url: string;
 	key: string;
