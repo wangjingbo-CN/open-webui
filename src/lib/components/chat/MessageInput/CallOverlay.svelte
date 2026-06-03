@@ -6,7 +6,13 @@
 
 	import { blobToFile } from '$lib/utils';
 	import { generateEmoji } from '$lib/apis';
-	import { synthesizeOpenAISpeech, transcribeAudio } from '$lib/apis/audio';
+	import {
+		getAudioConfig,
+		playPcm16SpeechStream,
+		synthesizeOpenAISpeech,
+		synthesizeOpenAISpeechStream,
+		transcribeAudio
+	} from '$lib/apis/audio';
 
 	import { toast } from 'svelte-sonner';
 
@@ -382,6 +388,25 @@
 	let currentMessageId = null;
 	let currentUtterance = null;
 
+
+	let audioConfigCache: any = null;
+	let audioConfigLoaded = false;
+	let currentTTSAbortController: AbortController | null = null;
+
+	const getCachedAudioConfig = async () => {
+		if (audioConfigLoaded) {
+			return audioConfigCache;
+		}
+
+		audioConfigLoaded = true;
+		audioConfigCache = await getAudioConfig(localStorage.token).catch((error) => {
+			console.warn('[CallOverlay TTS] getAudioConfig failed', error);
+			return null;
+		});
+
+		return audioConfigCache;
+	};
+
 	// Get voice: model-specific > user settings > config default
 	const getVoiceId = () => {
 		// Check for model-specific TTS voice first
@@ -393,6 +418,183 @@
 			return $settings?.audio?.tts?.voice ?? $config?.audio?.tts?.voice;
 		}
 		return $config?.audio?.tts?.voice;
+	};
+
+
+	const parseMaybeJson = (value: any): any => {
+		if (value === null || value === undefined) return value;
+
+		if (typeof value === 'string') {
+			const trimmed = value.trim();
+			if (!trimmed) return value;
+
+			if (
+				(trimmed.startsWith('{') && trimmed.endsWith('}')) ||
+				(trimmed.startsWith('[') && trimmed.endsWith(']'))
+			) {
+				try {
+					return JSON.parse(trimmed);
+				} catch {
+					return value;
+				}
+			}
+		}
+
+		return value;
+	};
+
+	const walkTTSConfig = (
+		value: any,
+		visitor: (key: string, value: any) => boolean | void,
+		key = '',
+		seen = new WeakSet<object>(),
+		depth = 0
+	): boolean => {
+		if (depth > 8 || value === null || value === undefined) return false;
+
+		const parsed = parseMaybeJson(value);
+
+		if (typeof parsed !== 'object' || parsed === null) {
+			return visitor(key, parsed) === true;
+		}
+
+		if (seen.has(parsed)) return false;
+		seen.add(parsed);
+
+		for (const [childKey, childValue] of Object.entries(parsed)) {
+			const parsedChildValue = parseMaybeJson(childValue);
+
+			if (visitor(String(childKey), parsedChildValue) === true) {
+				return true;
+			}
+
+			if (walkTTSConfig(parsedChildValue, visitor, String(childKey), seen, depth + 1)) {
+				return true;
+			}
+		}
+
+		return false;
+	};
+
+	const getTTSConfigRoots = (audioConfig?: any) => [
+		audioConfig?.tts,
+		$config?.audio?.tts,
+		$settings?.audio?.tts,
+		model?.info?.meta?.tts
+	];
+
+	const hasConfiguredMossTTSModel = (audioConfig?: any) =>
+		getTTSConfigRoots(audioConfig).some((root) =>
+			walkTTSConfig(root, (key, value) => {
+				const keyLower = String(key).toLowerCase();
+				const valueLower = typeof value === 'string' ? value.toLowerCase() : '';
+
+				if (!valueLower) return false;
+
+				if (
+					(keyLower.includes('model') || keyLower.includes('tts')) &&
+					(valueLower.includes('moss') || valueLower.includes('onnx'))
+				) {
+					return true;
+				}
+
+				if (valueLower.includes('moss-tts-nano') || valueLower.includes('moss_tts_nano')) {
+					return true;
+				}
+			})
+		);
+
+	const getConfiguredTTSModel = (audioConfig?: any) => {
+		const backendModel = audioConfig?.tts?.MODEL ?? audioConfig?.tts?.model;
+
+		if (typeof backendModel === 'string' && backendModel.trim()) {
+			return backendModel;
+		}
+
+		let resolvedModel: string | undefined;
+
+		for (const root of getTTSConfigRoots(audioConfig)) {
+			walkTTSConfig(root, (key, value) => {
+				if (resolvedModel) return true;
+
+				const keyLower = String(key).toLowerCase();
+				if (!keyLower.includes('model') || typeof value !== 'string') return false;
+
+				const valueLower = value.toLowerCase();
+				if (valueLower.includes('moss') || valueLower.includes('onnx')) {
+					resolvedModel = value;
+					return true;
+				}
+			});
+		}
+
+		return resolvedModel;
+	};
+
+	const isTTSStreamEnabled = (audioConfig?: any) => {
+		const value = audioConfig?.tts?.OPENAI_PARAMS?.stream;
+		return value === true || String(value).toLowerCase() === 'true';
+	};
+
+	const shouldUseMossStreamingTTS = (audioConfig?: any) => {
+		const engine = String(
+			audioConfig?.tts?.ENGINE ??
+				audioConfig?.tts?.engine ??
+				$config?.audio?.tts?.engine ??
+				''
+		).toLowerCase();
+
+		return (
+			engine === 'openai' &&
+			isTTSStreamEnabled(audioConfig) &&
+			hasConfiguredMossTTSModel(audioConfig)
+		);
+	};
+
+	const playStreamingTTS = async (content: string, signal: AbortSignal) => {
+		if (!content?.trim() || signal.aborted || !$showCallOverlay) return;
+
+		const audioConfig = await getCachedAudioConfig();
+		const configuredTTSModel = getConfiguredTTSModel(audioConfig);
+
+		currentTTSAbortController?.abort();
+		currentTTSAbortController = new AbortController();
+		const ttsSignal = currentTTSAbortController.signal;
+
+		const abortCurrentTTS = () => currentTTSAbortController?.abort();
+		signal.addEventListener('abort', abortCurrentTTS, { once: true });
+
+		try {
+			if (signal.aborted || ttsSignal.aborted || !$showCallOverlay) return;
+
+			const res = await synthesizeOpenAISpeechStream(
+				localStorage.token,
+				getVoiceId(),
+				content,
+				configuredTTSModel,
+				ttsSignal
+			).catch((error) => {
+				if (!ttsSignal.aborted && !signal.aborted) {
+					console.error('Error synthesizing streaming speech:', error);
+				}
+				return null;
+			});
+
+			if (!res || signal.aborted || ttsSignal.aborted || !$showCallOverlay) return;
+
+			await playPcm16SpeechStream(res, {
+				signal: ttsSignal,
+				playbackRate: $settings.audio?.tts?.playbackRate ?? 1,
+				initialBufferMs: 200,
+				minBufferMs: 160
+			});
+		} finally {
+			signal.removeEventListener('abort', abortCurrentTTS);
+
+			if (currentTTSAbortController?.signal === ttsSignal) {
+				currentTTSAbortController = null;
+			}
+		}
 	};
 
 	const speakSpeechSynthesisHandler = (content) => {
@@ -461,6 +663,13 @@
 		assistantSpeaking = false;
 		interrupted = true;
 
+		currentTTSAbortController?.abort();
+		currentTTSAbortController = null;
+
+		if (audioAbortController && !audioAbortController.signal.aborted) {
+			audioAbortController.abort();
+		}
+
 		if (chatStreaming) {
 			stopResponse();
 		}
@@ -495,6 +704,17 @@
 					}
 				}
 
+				const audioConfig = await getCachedAudioConfig();
+				if (
+					$config.audio.tts.engine !== '' &&
+					$settings.audio?.tts?.engine !== 'browser-kokoro' &&
+					shouldUseMossStreamingTTS(audioConfig)
+				) {
+					// Streaming audio is consumed directly by monitorAndPlayAudio.
+					// Do not prefetch/cache the Response body here.
+					return null;
+				}
+
 				if ($settings.audio?.tts?.engine === 'browser-kokoro') {
 					const url = await $TTSWorker
 						.generate({
@@ -510,7 +730,13 @@
 						audioCache.set(content, new Audio(url));
 					}
 				} else if ($config.audio.tts.engine !== '') {
-					const res = await synthesizeOpenAISpeech(localStorage.token, getVoiceId(), content).catch(
+					const configuredTTSModel = getConfiguredTTSModel(audioConfig);
+					const res = await synthesizeOpenAISpeech(
+						localStorage.token,
+						getVoiceId(),
+						content,
+						configuredTTSModel
+					).catch(
 						(error) => {
 							console.error(error);
 							return null;
@@ -541,7 +767,38 @@
 				// Retrieve the next content string from the queue
 				const content = messages[id].shift(); // Dequeues the content for playing
 
-				if (audioCache.has(content)) {
+				const audioConfig = await getCachedAudioConfig();
+				const shouldUseStreamingTTS =
+					$config.audio.tts.engine !== '' &&
+					$settings.audio?.tts?.engine !== 'browser-kokoro' &&
+					shouldUseMossStreamingTTS(audioConfig);
+
+				if (shouldUseStreamingTTS) {
+					if (($settings?.showEmojiInCall ?? false) && emojiCache.has(content)) {
+						emoji = emojiCache.get(content);
+					} else {
+						emoji = null;
+					}
+
+					try {
+						console.log(
+							'%c%s',
+							'color: red; font-size: 20px;',
+							`Streaming audio for content: ${content}`
+						);
+						await playStreamingTTS(content, signal);
+					} catch (error) {
+						if (!signal.aborted) {
+							console.error('Error playing streaming audio:', error);
+						}
+					}
+
+					if (signal.aborted) {
+						break;
+					}
+
+					await new Promise((resolve) => setTimeout(resolve, 100));
+				} else if (audioCache.has(content)) {
 					// If content is available in the cache, play it
 
 					// Set the emoji for the content if available
